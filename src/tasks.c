@@ -1,186 +1,246 @@
 #include "tasks.h"
 #include "timers_clocks.h"
 
-/* Job Body Tau 1: Control de Estabilidad (ESC) - 20ms */
-void job_body_tau1_esc(void)
+static float limit_range(float value, float lower, float upper)
 {
-    update_task_metrics(&g_vehicle_state.metrics_tau1, PERIOD_TAU1_US);
-
-    double t = get_elapsed_time_sec();
-
-    float inestabilidad = 0.0f;
-    if (t >= 3.0 && t <= 6.0) {
-        inestabilidad = 75.0f;
-    }
-
-    pthread_mutex_lock(&g_vehicle_state.state_mutex);
-
-    if (inestabilidad > 50.0f) {
-        g_vehicle_state.freno_esc = inestabilidad * 0.8f;
-        g_vehicle_state.alerta_activa = true;
-        pthread_cond_broadcast(&g_vehicle_state.cond_alert);
-    } else {
-        g_vehicle_state.freno_esc = 0.0f;
-        g_vehicle_state.alerta_activa = false;
-    }
-
-    g_vehicle_state.arreglo_compartido[0] = g_vehicle_state.freno_esc;
-
-    pthread_mutex_unlock(&g_vehicle_state.state_mutex);
+    return fminf(fmaxf(value, lower), upper);
 }
 
-/* Job Body Tau 2: Control de Traccion (TCS) - 40ms */
-void job_body_tau2_tcs(void)
+static bool lock_vehicle(vehicle_t *vehicle)
 {
-    update_task_metrics(&g_vehicle_state.metrics_tau2, PERIOD_TAU2_US);
-
-    double t = get_elapsed_time_sec();
-
-    float patinamiento = 0.0f;
-    if (t >= 4.0 && t <= 7.0) {
-        patinamiento = 40.0f;
+    int error = pthread_mutex_lock(&vehicle->mutex);
+    if (error != 0) {
+        fprintf(stderr, "pthread_mutex_lock(tarea): %s\n", strerror(error));
+        return false;
     }
-
-    pthread_mutex_lock(&g_vehicle_state.state_mutex);
-
-    float par = 100.0f - patinamiento - (g_vehicle_state.freno_esc * 0.5f);
-    if (par < 20.0f) par = 20.0f;
-    g_vehicle_state.par_motor = par;
-
-    g_vehicle_state.arreglo_compartido[1] = g_vehicle_state.par_motor;
-
-    static uint32_t s_seq = 0;
-    telemetry_entry_t entry;
-    entry.seq_num       = ++s_seq;
-    entry.timestamp_sec = t;
-    for (int i = 0; i < 4; i++) {
-        entry.datos[i] = g_vehicle_state.arreglo_compartido[i];
-    }
-    entry.alerta_activa = g_vehicle_state.alerta_activa;
-
-    pthread_mutex_unlock(&g_vehicle_state.state_mutex);
-
-    telemetry_push(&g_vehicle_state.telemetry, &entry);
+    return true;
 }
 
-/* Job Body Tau 3: Inyeccion de Combustible - 80ms */
-void job_body_tau3_injection(void)
+static bool unlock_vehicle(vehicle_t *vehicle)
 {
-    update_task_metrics(&g_vehicle_state.metrics_tau3, PERIOD_TAU3_US);
-
-    pthread_mutex_lock(&g_vehicle_state.state_mutex);
-
-    float iny = g_vehicle_state.par_motor * 0.8f;
-    if (g_vehicle_state.alerta_activa) {
-        iny *= 0.5f;
+    int error = pthread_mutex_unlock(&vehicle->mutex);
+    if (error != 0) {
+        fprintf(stderr, "pthread_mutex_unlock(tarea): %s\n", strerror(error));
+        return false;
     }
-    g_vehicle_state.inyeccion_combustible = iny;
-
-    g_vehicle_state.arreglo_compartido[2] = g_vehicle_state.inyeccion_combustible;
-
-    pthread_mutex_unlock(&g_vehicle_state.state_mutex);
+    return true;
 }
 
-/* Job Body Tau 4: Telemetria y Diagnostico - 160ms */
-void job_body_tau4_telemetry(void)
+static bool update_stability(task_context_t *context)
 {
-    update_task_metrics(&g_vehicle_state.metrics_tau4, PERIOD_TAU4_US);
+    vehicle_t *vehicle = context->vehicle;
+    double phase = fmod(elapsed_seconds(&vehicle->epoch), 5.0);
+    float lateral_g = (phase >= 1.2 && phase < 2.4) ? 0.93f : 0.22f;
+    const float stability_limit_g = 0.65f;
+    float brake_request = lateral_g > stability_limit_g
+        ? (lateral_g - stability_limit_g) * 120.0f
+        : 0.0f;
 
-    telemetry_entry_t entry;
-    int samples_processed = 0;
-    while (telemetry_pop(&g_vehicle_state.telemetry, &entry, false)) {
-        samples_processed++;
+    if (!lock_vehicle(vehicle)) {
+        return false;
     }
-
-    pthread_mutex_lock(&g_vehicle_state.state_mutex);
-
-    double t = get_elapsed_time_sec();
-    g_vehicle_state.arreglo_compartido[3] = g_vehicle_state.velocidad_kmh;
-
-    printf("[%6.3f s] Arreglo:[ESC:%3.0f%% | TCS(Par):%3.0f%% | Iny:%3.0f%% | Vel:%3.0f km/h] | Alerta: %-8s | Buffer: %d\n",
-           t,
-           g_vehicle_state.arreglo_compartido[0],
-           g_vehicle_state.arreglo_compartido[1],
-           g_vehicle_state.arreglo_compartido[2],
-           g_vehicle_state.arreglo_compartido[3],
-           g_vehicle_state.alerta_activa ? "¡PELIGRO!" : "OK",
-           samples_processed);
-
-    pthread_mutex_unlock(&g_vehicle_state.state_mutex);
+    vehicle->lateral_acceleration_g = lateral_g;
+    vehicle->stability_warning = lateral_g > stability_limit_g;
+    vehicle->signals[SIGNAL_BRAKE] = limit_range(brake_request, 0.0f, 45.0f);
+    return unlock_vehicle(vehicle);
 }
 
-void* thread_tau1_esc(void *arg)
+static bool update_traction(task_context_t *context)
 {
-    (void)arg;
-    posix_timer_task_t *timer = posix_timer_create_and_arm(OFFSET_TAU1_US, PERIOD_TAU1_US, SIG_TAU1_ESC);
-    if (!timer) {
-        fprintf(stderr, "Error inicializando timer Tau 1\n");
+    vehicle_t *vehicle = context->vehicle;
+    double phase = fmod(elapsed_seconds(&vehicle->epoch), 6.0);
+    float estimated_slip = (phase >= 2.0 && phase < 3.3) ? 24.0f : 5.0f;
+    vehicle_sample_t sample;
+
+    if (!lock_vehicle(vehicle)) {
+        return false;
+    }
+    float excess_slip = fmaxf(estimated_slip - 10.0f, 0.0f);
+    float torque = 96.0f - excess_slip * 2.0f
+        - vehicle->signals[SIGNAL_BRAKE] * 0.22f;
+    vehicle->wheel_slip_percent = estimated_slip;
+    vehicle->signals[SIGNAL_DRIVE_TORQUE] = limit_range(torque, 28.0f, 96.0f);
+
+    sample.sequence = vehicle->stats[context->task_index].releases;
+    sample.time_seconds = elapsed_seconds(&vehicle->epoch);
+    memcpy(sample.signals, vehicle->signals, sizeof(sample.signals));
+    sample.stability_warning = vehicle->stability_warning;
+    if (!unlock_vehicle(vehicle)) {
+        return false;
+    }
+
+    return sample_queue_put(vehicle, &sample)
+        || !vehicle_is_running(vehicle);
+}
+
+static bool update_fuel_and_speed(task_context_t *context)
+{
+    vehicle_t *vehicle = context->vehicle;
+    const float step_seconds = (float)FUEL_PERIOD_US / 1000000.0f;
+
+    if (!lock_vehicle(vehicle)) {
+        return false;
+    }
+    float brake = vehicle->signals[SIGNAL_BRAKE];
+    float torque = vehicle->signals[SIGNAL_DRIVE_TORQUE];
+    float speed = vehicle->signals[SIGNAL_SPEED];
+    float fuel_rate = 24.0f + torque * 0.62f + speed * 0.08f - brake * 0.18f;
+    float acceleration = torque * 0.022f - brake * 0.038f - 0.22f;
+
+    if (vehicle->stability_warning) {
+        fuel_rate *= 0.88f;
+    }
+    vehicle->signals[SIGNAL_FUEL_RATE] = limit_range(fuel_rate, 15.0f, 90.0f);
+    vehicle->signals[SIGNAL_SPEED] =
+        limit_range(speed + acceleration * step_seconds, 0.0f, 130.0f);
+    return unlock_vehicle(vehicle);
+}
+
+static bool report_samples(task_context_t *context)
+{
+    vehicle_t *vehicle = context->vehicle;
+    vehicle_sample_t sample;
+    size_t collected = 0;
+
+    if (!sample_queue_take(vehicle, &sample, true)) {
+        return !vehicle_is_running(vehicle);
+    }
+    ++collected;
+    vehicle_sample_t latest = sample;
+    while (sample_queue_take(vehicle, &sample, false)) {
+        latest = sample;
+        ++collected;
+    }
+
+    printf("[diag %5.2f s] muestras=%zu seq=%llu | freno=%4.1f%% "
+           "par=%4.1f%% combustible=%4.1f%% velocidad=%5.1f km/h | estabilidad=%s\n",
+           elapsed_seconds(&vehicle->epoch), collected,
+           (unsigned long long)latest.sequence,
+           latest.signals[SIGNAL_BRAKE],
+           latest.signals[SIGNAL_DRIVE_TORQUE],
+           latest.signals[SIGNAL_FUEL_RATE],
+           latest.signals[SIGNAL_SPEED],
+           latest.stability_warning ? "alerta" : "normal");
+    fflush(stdout);
+    return true;
+}
+
+void *task_stability(void *argument)
+{
+    task_context_t *context = argument;
+    vehicle_t *vehicle = context->vehicle;
+    signal_timer_t timer;
+
+    if (signal_timer_start(&timer, &vehicle->epoch, ESC_OFFSET_US,
+                           ESC_PERIOD_US, ESC_TIMER_SIGNAL) != 0) {
+        context->failed = true;
         return NULL;
     }
-
-    while (g_vehicle_state.system_running) {
-        posix_timer_wait_activation(timer);
-        if (!g_vehicle_state.system_running) break;
-        job_body_tau1_esc();
+    while (vehicle_is_running(vehicle)) {
+        if (signal_timer_wait(&timer) != 0) {
+            context->failed = true;
+            break;
+        }
+        if (!vehicle_is_running(vehicle)) {
+            break;
+        }
+        record_release(vehicle, context->task_index, ESC_PERIOD_US);
+        if (!update_stability(context)) {
+            context->failed = true;
+            break;
+        }
     }
-
-    posix_timer_destroy(timer);
+    if (signal_timer_stop(&timer) != 0) {
+        context->failed = true;
+    }
     return NULL;
 }
 
-void* thread_tau2_tcs(void *arg)
+void *task_traction(void *argument)
 {
-    (void)arg;
-    posix_timer_task_t *timer = posix_timer_create_and_arm(OFFSET_TAU2_US, PERIOD_TAU2_US, SIG_TAU2_TCS);
-    if (!timer) {
-        fprintf(stderr, "Error inicializando timer Tau 2\n");
+    task_context_t *context = argument;
+    vehicle_t *vehicle = context->vehicle;
+    signal_timer_t timer;
+
+    if (signal_timer_start(&timer, &vehicle->epoch, TCS_OFFSET_US,
+                           TCS_PERIOD_US, TCS_TIMER_SIGNAL) != 0) {
+        context->failed = true;
         return NULL;
     }
-
-    while (g_vehicle_state.system_running) {
-        posix_timer_wait_activation(timer);
-        if (!g_vehicle_state.system_running) break;
-        job_body_tau2_tcs();
+    while (vehicle_is_running(vehicle)) {
+        if (signal_timer_wait(&timer) != 0) {
+            context->failed = true;
+            break;
+        }
+        if (!vehicle_is_running(vehicle)) {
+            break;
+        }
+        record_release(vehicle, context->task_index, TCS_PERIOD_US);
+        if (!update_traction(context)) {
+            context->failed = true;
+            break;
+        }
     }
-
-    posix_timer_destroy(timer);
+    if (signal_timer_stop(&timer) != 0) {
+        context->failed = true;
+    }
     return NULL;
 }
 
-void* thread_tau3_injection(void *arg)
+void *task_fuel(void *argument)
 {
-    (void)arg;
-    posix_clock_task_t *clock_task = posix_clock_init_task(OFFSET_TAU3_US, PERIOD_TAU3_US, RT_CLOCK_SOURCE);
-    if (!clock_task) {
-        fprintf(stderr, "Error inicializando clock Tau 3\n");
+    task_context_t *context = argument;
+    vehicle_t *vehicle = context->vehicle;
+    clock_schedule_t schedule;
+
+    if (clock_schedule_start(&schedule, &vehicle->epoch, FUEL_OFFSET_US,
+                             FUEL_PERIOD_US) != 0) {
+        context->failed = true;
         return NULL;
     }
-
-    while (g_vehicle_state.system_running) {
-        posix_clock_wait_activation(clock_task);
-        if (!g_vehicle_state.system_running) break;
-        job_body_tau3_injection();
+    while (vehicle_is_running(vehicle)) {
+        if (clock_schedule_wait(&schedule) != 0) {
+            context->failed = true;
+            break;
+        }
+        if (!vehicle_is_running(vehicle)) {
+            break;
+        }
+        record_release(vehicle, context->task_index, FUEL_PERIOD_US);
+        if (!update_fuel_and_speed(context)) {
+            context->failed = true;
+            break;
+        }
     }
-
-    posix_clock_destroy(clock_task);
     return NULL;
 }
 
-void* thread_tau4_telemetry(void *arg)
+void *task_diagnostics(void *argument)
 {
-    (void)arg;
-    posix_clock_task_t *clock_task = posix_clock_init_task(OFFSET_TAU4_US, PERIOD_TAU4_US, RT_CLOCK_SOURCE);
-    if (!clock_task) {
-        fprintf(stderr, "Error inicializando clock Tau 4\n");
+    task_context_t *context = argument;
+    vehicle_t *vehicle = context->vehicle;
+    clock_schedule_t schedule;
+
+    if (clock_schedule_start(&schedule, &vehicle->epoch, DIAGNOSTICS_OFFSET_US,
+                             DIAGNOSTICS_PERIOD_US) != 0) {
+        context->failed = true;
         return NULL;
     }
-
-    while (g_vehicle_state.system_running) {
-        posix_clock_wait_activation(clock_task);
-        if (!g_vehicle_state.system_running) break;
-        job_body_tau4_telemetry();
+    while (vehicle_is_running(vehicle)) {
+        if (clock_schedule_wait(&schedule) != 0) {
+            context->failed = true;
+            break;
+        }
+        if (!vehicle_is_running(vehicle)) {
+            break;
+        }
+        record_release(vehicle, context->task_index, DIAGNOSTICS_PERIOD_US);
+        if (!report_samples(context)) {
+            if (vehicle_is_running(vehicle)) {
+                context->failed = true;
+            }
+            break;
+        }
     }
-
-    posix_clock_destroy(clock_task);
     return NULL;
 }

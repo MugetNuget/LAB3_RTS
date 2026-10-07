@@ -2,43 +2,42 @@
 #define CONFIG_H
 
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
-#include <time.h>
-#include <sys/time.h>
-#include <signal.h>
-#include <pthread.h>
-#include <unistd.h>
+
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <sched.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
-#define NSEC_PER_SEC            1000000000ULL
-#define USEC_PER_SEC            1000000ULL
-#define NSEC_PER_USEC           1000ULL
+#define NANOSECONDS_PER_SECOND 1000000000L
+#define MICROSECONDS_PER_SECOND 1000000L
+#define NANOSECONDS_PER_MICROSECOND 1000L
 
-/* Parametros temporales de las tareas */
-#define PERIOD_TAU1_US          20000
-#define OFFSET_TAU1_US          10000
+#define TASK_COUNT 4
+#define LOG_CAPACITY 16
+#define DEFAULT_RUN_SECONDS 8
+#define MAX_RUN_SECONDS 300
 
-#define PERIOD_TAU2_US          40000
-#define OFFSET_TAU2_US          20000
+#define ESC_PERIOD_US 20000U
+#define TCS_PERIOD_US 40000U
+#define FUEL_PERIOD_US 80000U
+#define DIAGNOSTICS_PERIOD_US 160000U
 
-#define PERIOD_TAU3_US          80000
-#define OFFSET_TAU3_US          30000
+#define ESC_OFFSET_US 5000U
+#define TCS_OFFSET_US 25000U
+#define FUEL_OFFSET_US 45000U
+#define DIAGNOSTICS_OFFSET_US 70000U
 
-#define PERIOD_TAU4_US          160000
-#define OFFSET_TAU4_US          40000
+#define ESC_TIMER_SIGNAL (SIGRTMIN + 1)
+#define TCS_TIMER_SIGNAL (SIGRTMIN + 2)
 
-/* Senales de tiempo real para temporizadores POSIX */
-#define SIG_TAU1_ESC            (SIGRTMIN + 1)
-#define SIG_TAU2_TCS            (SIGRTMIN + 2)
+#define TASK_CLOCK CLOCK_MONOTONIC
 
-#define RT_CLOCK_SOURCE         CLOCK_MONOTONIC
-#define DEFAULT_SIM_TIME_SEC    10
-#define TELEMETRY_BUFFER_SIZE   32
-
-#endif /* CONFIG_H */
+#endif

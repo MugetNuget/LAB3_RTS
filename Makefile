@@ -9,11 +9,12 @@ SRC_DIR     := src
 INC_DIR     := include
 BUILD_DIR   := build
 TARGET      := automotive_control
+RUN_SECONDS ?= 8
 
 SRCS        := $(wildcard $(SRC_DIR)/*.c)
 OBJS        := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
 
-CFLAGS      := -Wall -Wextra -O2 -I$(INC_DIR) -pthread
+CFLAGS      := -std=c11 -Wall -Wextra -Wpedantic -O2 -I$(INC_DIR) -pthread
 LDFLAGS     := -pthread -lrt -lm
 
 STATIC ?= 0
@@ -33,7 +34,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 run: $(TARGET)
-	./$(TARGET) 10
+	./$(TARGET) $(RUN_SECONDS)
 
 rpi:
 	$(MAKE) clean

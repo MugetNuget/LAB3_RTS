@@ -1,170 +1,225 @@
-#include "config.h"
-#include "timers_clocks.h"
-#include "vehicle_state.h"
 #include "tasks.h"
-#include <sched.h>
+#include "timers_clocks.h"
 
-static void set_thread_cpu_affinity(pthread_t thread, int core_id)
+typedef struct {
+    const char *label;
+    const char *mechanism;
+    void *(*entry)(void *);
+    uint64_t period_us;
+    uint64_t offset_us;
+} task_definition_t;
+
+static const task_definition_t task_definitions[TASK_COUNT] = {
+    {"ESC / estabilidad", "timer + SIGRTMIN+1", task_stability,
+     ESC_PERIOD_US, ESC_OFFSET_US},
+    {"TCS / traccion", "timer + SIGRTMIN+2", task_traction,
+     TCS_PERIOD_US, TCS_OFFSET_US},
+    {"Inyeccion y velocidad", "CLOCK_MONOTONIC", task_fuel,
+     FUEL_PERIOD_US, FUEL_OFFSET_US},
+    {"Diagnostico", "CLOCK_MONOTONIC", task_diagnostics,
+     DIAGNOSTICS_PERIOD_US, DIAGNOSTICS_OFFSET_US}
+};
+
+static int task_stop_signal(unsigned task_index)
 {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
-
-    int s = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
-    if (s != 0) {
-        fprintf(stderr, "[AVISO] No se pudo asignar al Core %d: %s\n", core_id, strerror(s));
+    if (task_index == 0) {
+        return ESC_TIMER_SIGNAL;
     }
+    if (task_index == 1) {
+        return TCS_TIMER_SIGNAL;
+    }
+    return 0;
 }
 
-static void print_final_report(int sim_time_sec)
+static int parse_duration(int argc, char **argv, unsigned *duration)
 {
-    printf("\n=========================================================================================================\n");
-    printf("                       INFORME DE EJECUCION Y DETERMINISMO DE TIEMPO REAL\n");
-    printf("=========================================================================================================\n");
-    printf("Duracion de la prueba: %d segundos\n\n", sim_time_sec);
+    *duration = DEFAULT_RUN_SECONDS;
+    if (argc < 2) {
+        return 0;
+    }
 
-    printf("%-6s | %-24s | %-13s | %-9s | %-9s | %-10s | %-10s | %-10s\n",
-           "Tarea", "Funcion", "Mecanismo", "T Nom(ms)", "Act. Esp", "Act. Real", "T Prom(ms)", "Max Jitter");
-    printf("---------------------------------------------------------------------------------------------------------\n");
-
-    uint32_t expected_tau1 = (sim_time_sec * 1000) / (PERIOD_TAU1_US / 1000);
-    printf("%-6s | %-24s | %-13s | %9.1f | %9u | %10u | %10.3f | %8ld us\n",
-           "Tau 1", "Control Estabilidad(ESC)", "POSIX Timer",
-           (float)PERIOD_TAU1_US / 1000.0f, expected_tau1,
-           g_vehicle_state.metrics_tau1.activations,
-           g_vehicle_state.metrics_tau1.avg_period_us / 1000.0,
-           g_vehicle_state.metrics_tau1.max_jitter_us);
-
-    uint32_t expected_tau2 = (sim_time_sec * 1000) / (PERIOD_TAU2_US / 1000);
-    printf("%-6s | %-24s | %-13s | %9.1f | %9u | %10u | %10.3f | %8ld us\n",
-           "Tau 2", "Control Traccion (TCS)", "POSIX Timer",
-           (float)PERIOD_TAU2_US / 1000.0f, expected_tau2,
-           g_vehicle_state.metrics_tau2.activations,
-           g_vehicle_state.metrics_tau2.avg_period_us / 1000.0,
-           g_vehicle_state.metrics_tau2.max_jitter_us);
-
-    uint32_t expected_tau3 = (sim_time_sec * 1000) / (PERIOD_TAU3_US / 1000);
-    printf("%-6s | %-24s | %-13s | %9.1f | %9u | %10u | %10.3f | %8ld us\n",
-           "Tau 3", "Inyeccion Combustible", "POSIX Clock",
-           (float)PERIOD_TAU3_US / 1000.0f, expected_tau3,
-           g_vehicle_state.metrics_tau3.activations,
-           g_vehicle_state.metrics_tau3.avg_period_us / 1000.0,
-           g_vehicle_state.metrics_tau3.max_jitter_us);
-
-    uint32_t expected_tau4 = (sim_time_sec * 1000) / (PERIOD_TAU4_US / 1000);
-    printf("%-6s | %-24s | %-13s | %9.1f | %9u | %10u | %10.3f | %8ld us\n",
-           "Tau 4", "Telemetria (Soft-RT)", "POSIX Clock",
-           (float)PERIOD_TAU4_US / 1000.0f, expected_tau4,
-           g_vehicle_state.metrics_tau4.activations,
-           g_vehicle_state.metrics_tau4.avg_period_us / 1000.0,
-           g_vehicle_state.metrics_tau4.max_jitter_us);
-
-    printf("=========================================================================================================\n");
-    printf("Estado final del arreglo compartido:\n");
-    printf("  [0] Freno ESC:        %5.1f %%\n", g_vehicle_state.arreglo_compartido[0]);
-    printf("  [1] Par Motor (TCS):  %5.1f %%\n", g_vehicle_state.arreglo_compartido[1]);
-    printf("  [2] Inyeccion:        %5.1f %%\n", g_vehicle_state.arreglo_compartido[2]);
-    printf("  [3] Velocidad (Diag): %5.1f km/h\n", g_vehicle_state.arreglo_compartido[3]);
-    printf("Sincronizacion y consistencia de datos compartidos verificada con exito.\n");
-    printf("=========================================================================================================\n\n");
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(argv[1], &end, 10);
+    if (errno != 0 || end == argv[1] || *end != '\0'
+        || parsed < 1 || parsed > MAX_RUN_SECONDS) {
+        fprintf(stderr, "Duracion invalida. Use un entero entre 1 y %d segundos.\n",
+                MAX_RUN_SECONDS);
+        return -1;
+    }
+    *duration = (unsigned)parsed;
+    return 0;
 }
 
-int main(int argc, char *argv[])
+static void print_configuration(unsigned duration)
 {
-    int sim_time_sec = DEFAULT_SIM_TIME_SEC;
-    if (argc >= 2) {
-        int t = atoi(argv[1]);
-        if (t > 0 && t <= 300) {
-            sim_time_sec = t;
-        }
+    printf("Control automotriz simulado con tareas POSIX periodicas\n");
+    printf("Duracion: %u s | reloj base: CLOCK_MONOTONIC\n", duration);
+    printf("%-4s %-27s %-24s %10s %10s\n",
+           "ID", "Funcion", "Mecanismo", "Periodo", "Offset");
+    for (unsigned i = 0; i < TASK_COUNT; ++i) {
+        printf("Tau%u %-27s %-24s %8llu ms %8llu ms\n",
+               i + 1, task_definitions[i].label, task_definitions[i].mechanism,
+               (unsigned long long)(task_definitions[i].period_us / 1000U),
+               (unsigned long long)(task_definitions[i].offset_us / 1000U));
+    }
+    printf("Estado inicial: velocidad=54 km/h, par=72%%, combustible=58%%\n\n");
+}
+
+static int sleep_until(const struct timespec *deadline)
+{
+    int error;
+    do {
+        error = clock_nanosleep(TASK_CLOCK, TIMER_ABSTIME, deadline, NULL);
+    } while (error == EINTR);
+    if (error != 0) {
+        fprintf(stderr, "clock_nanosleep(fin de simulacion): %s\n",
+                strerror(error));
+    }
+    return error;
+}
+
+static void print_results(vehicle_t *vehicle)
+{
+    printf("\nResumen de activaciones y variacion temporal\n");
+    printf("%-4s %-27s %10s %14s %14s\n",
+           "ID", "Funcion", "Activaciones", "Periodo medio", "Jitter max.");
+    for (unsigned i = 0; i < TASK_COUNT; ++i) {
+        const release_stats_t *stats = &vehicle->stats[i];
+        double mean_ms = stats->releases > 1
+            ? (double)(stats->accumulated_period_us
+                       / (long double)(stats->releases - 1U)) / 1000.0
+            : 0.0;
+        printf("Tau%u %-27s %12llu %11.3f ms %10lld us\n",
+               i + 1, task_definitions[i].label,
+               (unsigned long long)stats->releases,
+               mean_ms,
+               (long long)stats->greatest_jitter_us);
     }
 
-    printf("\n");
-    printf("==================================================================================\n");
-    printf("    SISTEMAS DE TIEMPO REAL - PRACTICA 3: CONTROL AUTOMOTRIZ CONCURRENTE\n");
-    printf("==================================================================================\n");
-    printf("Configuracion de Tareas de Tiempo Real (POSIX-RT):\n");
-    printf("  [Tau 1] ESC/ESP:    Periodo = %2d ms (50.0 Hz) | Offset = %2d ms | POSIX Timer (SIGRTMIN+1)\n",
-           PERIOD_TAU1_US / 1000, OFFSET_TAU1_US / 1000);
-    printf("  [Tau 2] TCS:        Periodo = %2d ms (25.0 Hz) | Offset = %2d ms | POSIX Timer (SIGRTMIN+2)\n",
-           PERIOD_TAU2_US / 1000, OFFSET_TAU2_US / 1000);
-    printf("  [Tau 3] Inyeccion:  Periodo = %2d ms (12.5 Hz) | Offset = %2d ms | POSIX Clock (TIMER_ABSTIME)\n",
-           PERIOD_TAU3_US / 1000, OFFSET_TAU3_US / 1000);
-    printf("  [Tau 4] Telemetria: Periodo = %2d ms ( 6.2 Hz) | Offset = %2d ms | POSIX Clock (TIMER_ABSTIME)\n",
-           PERIOD_TAU4_US / 1000, OFFSET_TAU4_US / 1000);
-    printf("Tiempo total de ejecucion programado: %d segundos\n", sim_time_sec);
-    printf("==================================================================================\n\n");
-
-    /* Bloqueo de senales RT antes de crear hilos para herencia de mascara */
-    sigset_t alarm_sigset;
-    sigemptyset(&alarm_sigset);
-    sigaddset(&alarm_sigset, SIG_TAU1_ESC);
-    sigaddset(&alarm_sigset, SIG_TAU2_TCS);
-    for (int i = SIGRTMIN; i <= SIGRTMAX; i++) {
-        sigaddset(&alarm_sigset, i);
+    int error = pthread_mutex_lock(&vehicle->mutex);
+    if (error != 0) {
+        fprintf(stderr, "pthread_mutex_lock(resumen): %s\n", strerror(error));
+        return;
     }
-    int sig_mask_res = pthread_sigmask(SIG_BLOCK, &alarm_sigset, NULL);
-    if (sig_mask_res != 0) {
-        fprintf(stderr, "Error en pthread_sigmask: %s\n", strerror(sig_mask_res));
+    printf("\nEstado final: freno=%.1f%%, par=%.1f%%, combustible=%.1f%%, "
+           "velocidad=%.1f km/h; aceleracion lateral=%.2fg, patinamiento=%.1f%%\n",
+           vehicle->signals[SIGNAL_BRAKE],
+           vehicle->signals[SIGNAL_DRIVE_TORQUE],
+           vehicle->signals[SIGNAL_FUEL_RATE],
+           vehicle->signals[SIGNAL_SPEED],
+           vehicle->lateral_acceleration_g,
+           vehicle->wheel_slip_percent);
+    pthread_mutex_unlock(&vehicle->mutex);
+}
+
+int main(int argc, char **argv)
+{
+    unsigned duration;
+    if (parse_duration(argc, argv, &duration) != 0) {
         return EXIT_FAILURE;
     }
 
-    vehicle_state_init(&g_vehicle_state);
-
-    pthread_t th_tau1, th_tau2, th_tau3, th_tau4;
-
-    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
-    printf("[INFO] Procesadores logicos disponibles en el sistema: %d\n", num_cores);
-
-    pthread_create(&th_tau1, NULL, thread_tau1_esc, NULL);
-    pthread_create(&th_tau2, NULL, thread_tau2_tcs, NULL);
-    pthread_create(&th_tau3, NULL, thread_tau3_injection, NULL);
-    pthread_create(&th_tau4, NULL, thread_tau4_telemetry, NULL);
-
-    pthread_setname_np(th_tau1, "rt_tau1_esc");
-    pthread_setname_np(th_tau2, "rt_tau2_tcs");
-    pthread_setname_np(th_tau3, "rt_tau3_inj");
-    pthread_setname_np(th_tau4, "rt_tau4_tel");
-
-    if (num_cores >= 4) {
-        set_thread_cpu_affinity(th_tau1, 0);
-        set_thread_cpu_affinity(th_tau2, 1);
-        set_thread_cpu_affinity(th_tau3, 2);
-        set_thread_cpu_affinity(th_tau4, 3);
-        printf("[INFO] Hilos asignados deterministamente a los 4 nucleos de CPU:\n");
-        printf("       -> rt_tau1_esc:  Core 0 (ESC/ESP - 20ms)\n");
-        printf("       -> rt_tau2_tcs:  Core 1 (TCS     - 40ms)\n");
-        printf("       -> rt_tau3_inj:  Core 2 (Inyec   - 80ms)\n");
-        printf("       -> rt_tau4_tel:  Core 3 (Telem   - 160ms)\n\n");
-    } else {
-        printf("[INFO] Mapeo de afinidad adaptado a %d nucleos.\n\n", num_cores);
+    vehicle_t vehicle;
+    if (vehicle_init(&vehicle) != 0) {
+        return EXIT_FAILURE;
     }
 
-    sleep(sim_time_sec);
+    sigset_t timer_signals;
+    sigemptyset(&timer_signals);
+    sigaddset(&timer_signals, ESC_TIMER_SIGNAL);
+    sigaddset(&timer_signals, TCS_TIMER_SIGNAL);
+    int error = pthread_sigmask(SIG_BLOCK, &timer_signals, NULL);
+    if (error != 0) {
+        fprintf(stderr, "pthread_sigmask: %s\n", strerror(error));
+        vehicle_destroy(&vehicle);
+        return EXIT_FAILURE;
+    }
 
-    printf("\n[INFO] Tiempo de prueba cumplido. Deteniendo hilos de tiempo real...\n");
+    if (clock_gettime(TASK_CLOCK, &vehicle.epoch) != 0) {
+        perror("clock_gettime(epoch)");
+        vehicle_destroy(&vehicle);
+        return EXIT_FAILURE;
+    }
+    timespec_add_microseconds(&vehicle.epoch, 100000U);
+    print_configuration(duration);
 
-    pthread_mutex_lock(&g_vehicle_state.state_mutex);
-    g_vehicle_state.system_running = false;
-    pthread_cond_broadcast(&g_vehicle_state.cond_alert);
-    pthread_mutex_unlock(&g_vehicle_state.state_mutex);
+    pthread_t threads[TASK_COUNT];
+    task_context_t contexts[TASK_COUNT];
+    unsigned started = 0;
+    for (; started < TASK_COUNT; ++started) {
+        contexts[started].vehicle = &vehicle;
+        contexts[started].task_index = started;
+        contexts[started].failed = false;
+        error = pthread_create(&threads[started], NULL,
+                               task_definitions[started].entry,
+                               &contexts[started]);
+        if (error != 0) {
+            fprintf(stderr, "pthread_create(Tau%u): %s\n",
+                    started + 1, strerror(error));
+            break;
+        }
+    }
 
-    pthread_mutex_lock(&g_vehicle_state.telemetry.mutex);
-    pthread_cond_broadcast(&g_vehicle_state.telemetry.not_empty);
-    pthread_cond_broadcast(&g_vehicle_state.telemetry.not_full);
-    pthread_mutex_unlock(&g_vehicle_state.telemetry.mutex);
+    if (started != TASK_COUNT) {
+        vehicle_stop(&vehicle);
+        for (unsigned i = 0; i < started; ++i) {
+            int stop_signal = task_stop_signal(i);
+            if (stop_signal != 0) {
+                int signal_error = pthread_kill(threads[i], stop_signal);
+                if (signal_error != 0) {
+                    fprintf(stderr, "pthread_kill(Tau%u): %s\n",
+                            i + 1, strerror(signal_error));
+                }
+            }
+        }
+        for (unsigned i = 0; i < started; ++i) {
+            pthread_join(threads[i], NULL);
+        }
+        vehicle_destroy(&vehicle);
+        return EXIT_FAILURE;
+    }
 
-    pthread_kill(th_tau1, SIG_TAU1_ESC);
-    pthread_kill(th_tau2, SIG_TAU2_TCS);
+    struct timespec finish = vehicle.epoch;
+    finish.tv_sec += (time_t)duration;
+    if (sleep_until(&finish) != 0) {
+        vehicle_stop(&vehicle);
+        for (unsigned i = 0; i < TASK_COUNT; ++i) {
+            int stop_signal = task_stop_signal(i);
+            if (stop_signal != 0) {
+                pthread_kill(threads[i], stop_signal);
+            }
+        }
+        for (unsigned i = 0; i < TASK_COUNT; ++i) {
+            pthread_join(threads[i], NULL);
+        }
+        vehicle_destroy(&vehicle);
+        return EXIT_FAILURE;
+    }
 
-    pthread_join(th_tau1, NULL);
-    pthread_join(th_tau2, NULL);
-    pthread_join(th_tau3, NULL);
-    pthread_join(th_tau4, NULL);
+    vehicle_stop(&vehicle);
+    for (unsigned i = 0; i < TASK_COUNT; ++i) {
+        int stop_signal = task_stop_signal(i);
+        if (stop_signal != 0) {
+            error = pthread_kill(threads[i], stop_signal);
+            if (error != 0) {
+                fprintf(stderr, "pthread_kill(Tau%u): %s\n",
+                        i + 1, strerror(error));
+            }
+        }
+    }
+    bool tasks_failed = false;
+    for (unsigned i = 0; i < TASK_COUNT; ++i) {
+        error = pthread_join(threads[i], NULL);
+        if (error != 0) {
+            fprintf(stderr, "pthread_join(Tau%u): %s\n",
+                    i + 1, strerror(error));
+            tasks_failed = true;
+        }
+        tasks_failed = tasks_failed || contexts[i].failed;
+    }
 
-    print_final_report(sim_time_sec);
-
-    vehicle_state_destroy(&g_vehicle_state);
-
-    return EXIT_SUCCESS;
+    print_results(&vehicle);
+    vehicle_destroy(&vehicle);
+    return tasks_failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }

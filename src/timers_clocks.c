@@ -1,150 +1,116 @@
 #include "timers_clocks.h"
 
-static struct timespec g_sim_start_time;
-static bool g_sim_start_recorded = false;
-
-void timespec_add_us(struct timespec *t, uint64_t delta_us)
+void timespec_add_microseconds(struct timespec *time, uint64_t microseconds)
 {
-    uint64_t delta_ns = delta_us * NSEC_PER_USEC;
-    delta_ns += t->tv_nsec;
-
-    t->tv_sec += delta_ns / NSEC_PER_SEC;
-    t->tv_nsec = delta_ns % NSEC_PER_SEC;
+    uint64_t nanoseconds = (uint64_t)time->tv_nsec
+        + microseconds * (uint64_t)NANOSECONDS_PER_MICROSECOND;
+    time->tv_sec += (time_t)(nanoseconds / (uint64_t)NANOSECONDS_PER_SECOND);
+    time->tv_nsec = (long)(nanoseconds % (uint64_t)NANOSECONDS_PER_SECOND);
 }
 
-int64_t timespec_diff_us(const struct timespec *start, const struct timespec *end)
+int64_t timespec_difference_microseconds(const struct timespec *start,
+                                         const struct timespec *end)
 {
-    int64_t sec_diff  = (int64_t)(end->tv_sec - start->tv_sec);
-    int64_t nsec_diff = (int64_t)(end->tv_nsec - start->tv_nsec);
-    return (sec_diff * (int64_t)USEC_PER_SEC) + (nsec_diff / (int64_t)NSEC_PER_USEC);
+    int64_t seconds = (int64_t)end->tv_sec - (int64_t)start->tv_sec;
+    int64_t nanoseconds = (int64_t)end->tv_nsec - (int64_t)start->tv_nsec;
+    return seconds * MICROSECONDS_PER_SECOND
+        + nanoseconds / NANOSECONDS_PER_MICROSECOND;
 }
 
-double get_elapsed_time_sec(void)
+int signal_timer_start(signal_timer_t *timer, const struct timespec *epoch,
+                       uint64_t offset_us, uint64_t period_us, int signal_number)
 {
-    struct timespec now;
-    clock_gettime(RT_CLOCK_SOURCE, &now);
-
-    if (!g_sim_start_recorded) {
-        g_sim_start_time = now;
-        g_sim_start_recorded = true;
-        return 0.0;
+    if (period_us == 0) {
+        fprintf(stderr, "El periodo del temporizador debe ser mayor que cero.\n");
+        return EINVAL;
     }
 
-    return (double)(now.tv_sec - g_sim_start_time.tv_sec) +
-           (double)(now.tv_nsec - g_sim_start_time.tv_nsec) / 1e9;
+    memset(timer, 0, sizeof(*timer));
+    sigemptyset(&timer->awaited_signal);
+    sigaddset(&timer->awaited_signal, signal_number);
+
+    struct sigevent notification;
+    memset(&notification, 0, sizeof(notification));
+    notification.sigev_notify = SIGEV_SIGNAL;
+    notification.sigev_signo = signal_number;
+
+    if (timer_create(TASK_CLOCK, &notification, &timer->id) != 0) {
+        int error = errno;
+        fprintf(stderr, "timer_create: %s\n", strerror(error));
+        return error;
+    }
+    timer->active = true;
+
+    struct itimerspec settings;
+    memset(&settings, 0, sizeof(settings));
+    settings.it_value = *epoch;
+    timespec_add_microseconds(&settings.it_value, offset_us);
+    settings.it_interval.tv_sec = (time_t)(period_us / MICROSECONDS_PER_SECOND);
+    settings.it_interval.tv_nsec =
+        (long)((period_us % MICROSECONDS_PER_SECOND)
+               * NANOSECONDS_PER_MICROSECOND);
+
+    if (timer_settime(timer->id, TIMER_ABSTIME, &settings, NULL) != 0) {
+        int error = errno;
+        fprintf(stderr, "timer_settime: %s\n", strerror(error));
+        timer_delete(timer->id);
+        timer->active = false;
+        return error;
+    }
+    return 0;
 }
 
-/* Inicializa y arma un temporizador POSIX */
-posix_timer_task_t* posix_timer_create_and_arm(uint64_t offset_us, uint64_t period_us, int signo)
+int signal_timer_wait(signal_timer_t *timer)
 {
-    posix_timer_task_t *task = malloc(sizeof(posix_timer_task_t));
-    if (!task) {
-        perror("malloc");
-        return NULL;
+    int received_signal = 0;
+    int error = sigwait(&timer->awaited_signal, &received_signal);
+    if (error != 0) {
+        fprintf(stderr, "sigwait: %s\n", strerror(error));
     }
-
-    task->signo     = signo;
-    task->period_us = period_us;
-    task->offset_us = offset_us;
-
-    sigemptyset(&task->sigset);
-    sigaddset(&task->sigset, signo);
-
-    memset(&task->sigev, 0, sizeof(struct sigevent));
-    task->sigev.sigev_notify = SIGEV_SIGNAL;
-    task->sigev.sigev_signo  = signo;
-
-    int ret = timer_create(RT_CLOCK_SOURCE, &task->sigev, &task->timer_id);
-    if (ret != 0) {
-        perror("timer_create");
-        free(task);
-        return NULL;
-    }
-
-    memset(&task->its, 0, sizeof(struct itimerspec));
-    
-    if (offset_us == 0) {
-        task->its.it_value.tv_sec  = 0;
-        task->its.it_value.tv_nsec = 1000;
-    } else {
-        task->its.it_value.tv_sec  = offset_us / USEC_PER_SEC;
-        task->its.it_value.tv_nsec = (offset_us % USEC_PER_SEC) * NSEC_PER_USEC;
-    }
-
-    task->its.it_interval.tv_sec  = period_us / USEC_PER_SEC;
-    task->its.it_interval.tv_nsec = (period_us % USEC_PER_SEC) * NSEC_PER_USEC;
-
-    ret = timer_settime(task->timer_id, 0, &task->its, NULL);
-    if (ret != 0) {
-        perror("timer_settime");
-        timer_delete(task->timer_id);
-        free(task);
-        return NULL;
-    }
-
-    return task;
+    return error;
 }
 
-/* Espera la expiracion del temporizador con sigwait */
-void posix_timer_wait_activation(posix_timer_task_t *task)
+int signal_timer_stop(signal_timer_t *timer)
 {
-    int sig_received = 0;
-    int ret = sigwait(&task->sigset, &sig_received);
-    if (ret != 0) {
-        perror("sigwait");
+    if (!timer->active) {
+        return 0;
     }
+    if (timer_delete(timer->id) != 0) {
+        int error = errno;
+        fprintf(stderr, "timer_delete: %s\n", strerror(error));
+        timer->active = false;
+        return error;
+    }
+    timer->active = false;
+    return 0;
 }
 
-void posix_timer_destroy(posix_timer_task_t *task)
+int clock_schedule_start(clock_schedule_t *schedule, const struct timespec *epoch,
+                         uint64_t offset_us, uint64_t period_us)
 {
-    if (task) {
-        timer_delete(task->timer_id);
-        free(task);
+    if (period_us == 0) {
+        fprintf(stderr, "El periodo del reloj debe ser mayor que cero.\n");
+        return EINVAL;
     }
+    schedule->clock_id = TASK_CLOCK;
+    schedule->deadline = *epoch;
+    timespec_add_microseconds(&schedule->deadline, offset_us);
+    schedule->period_us = period_us;
+    return 0;
 }
 
-/* Inicializa tarea periodica con reloj POSIX */
-posix_clock_task_t* posix_clock_init_task(uint64_t offset_us, uint64_t period_us, clockid_t clock_id)
+int clock_schedule_wait(clock_schedule_t *schedule)
 {
-    posix_clock_task_t *task = malloc(sizeof(posix_clock_task_t));
-    if (!task) {
-        perror("malloc");
-        return NULL;
-    }
-
-    task->clock_id  = clock_id;
-    task->period_us = period_us;
-    task->offset_us = offset_us;
-
-    int ret = clock_gettime(clock_id, &task->next_activation);
-    if (ret != 0) {
-        perror("clock_gettime");
-        free(task);
-        return NULL;
-    }
-
-    timespec_add_us(&task->next_activation, offset_us);
-    return task;
-}
-
-/* Espera la siguiente activacion con clock_nanosleep absoluto */
-void posix_clock_wait_activation(posix_clock_task_t *task)
-{
-    int ret;
+    int error;
     do {
-        ret = clock_nanosleep(task->clock_id, TIMER_ABSTIME, &task->next_activation, NULL);
-    } while (ret == EINTR);
+        error = clock_nanosleep(schedule->clock_id, TIMER_ABSTIME,
+                                &schedule->deadline, NULL);
+    } while (error == EINTR);
 
-    if (ret != 0 && ret != EINTR) {
-        perror("clock_nanosleep");
+    if (error != 0) {
+        fprintf(stderr, "clock_nanosleep: %s\n", strerror(error));
+        return error;
     }
-
-    timespec_add_us(&task->next_activation, task->period_us);
-}
-
-void posix_clock_destroy(posix_clock_task_t *task)
-{
-    if (task) {
-        free(task);
-    }
+    timespec_add_microseconds(&schedule->deadline, schedule->period_us);
+    return 0;
 }

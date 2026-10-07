@@ -3,64 +3,70 @@
 
 #include "config.h"
 
-/* Estructura para muestras del buffer de telemetria */
+typedef enum {
+    SIGNAL_BRAKE = 0,
+    SIGNAL_DRIVE_TORQUE,
+    SIGNAL_FUEL_RATE,
+    SIGNAL_SPEED,
+    SIGNAL_COUNT
+} signal_channel_t;
+
 typedef struct {
-    uint32_t    seq_num;
-    double      timestamp_sec;
-    float       datos[4];
-    bool        alerta_activa;
-} telemetry_entry_t;
+    uint64_t sequence;
+    double time_seconds;
+    float signals[SIGNAL_COUNT];
+    bool stability_warning;
+} vehicle_sample_t;
 
-/* Buffer circular sincronizado */
 typedef struct {
-    telemetry_entry_t   buffer[TELEMETRY_BUFFER_SIZE];
-    int                 in;
-    int                 out;
-    int                 count;
-    pthread_mutex_t     mutex;
-    pthread_cond_t      not_full;
-    pthread_cond_t      not_empty;
-} circular_telemetry_t;
+    vehicle_sample_t items[LOG_CAPACITY];
+    size_t read_index;
+    size_t write_index;
+    size_t size;
+    pthread_mutex_t mutex;
+    pthread_cond_t item_ready;
+    pthread_cond_t space_ready;
+} sample_queue_t;
 
-/* Metricas de determinismo por tarea */
 typedef struct {
-    uint32_t            activations;
-    int64_t             min_period_us;
-    int64_t             max_period_us;
-    double              avg_period_us;
-    int64_t             max_jitter_us;
-    struct timespec     last_activation;
-} task_metrics_t;
+    uint64_t releases;
+    int64_t shortest_period_us;
+    int64_t longest_period_us;
+    int64_t greatest_jitter_us;
+    long double accumulated_period_us;
+    struct timespec previous_release;
+} release_stats_t;
 
-/* Estado compartido del vehiculo */
 typedef struct {
-    float               arreglo_compartido[4];
-    float               velocidad_kmh;
-    float               freno_esc;
-    float               par_motor;
-    float               inyeccion_combustible;
-    bool                alerta_activa;
-    bool                system_running;
+    float signals[SIGNAL_COUNT];
+    float lateral_acceleration_g;
+    float wheel_slip_percent;
+    bool stability_warning;
+    bool running;
+    pthread_mutex_t mutex;
+    sample_queue_t samples;
+    release_stats_t stats[TASK_COUNT];
+    struct timespec epoch;
+} vehicle_t;
 
-    pthread_mutex_t     state_mutex;
-    pthread_cond_t      cond_alert;
+typedef struct {
+    vehicle_t *vehicle;
+    unsigned task_index;
+    bool failed;
+} task_context_t;
 
-    circular_telemetry_t telemetry;
+int vehicle_init(vehicle_t *vehicle);
+void vehicle_destroy(vehicle_t *vehicle);
+void vehicle_stop(vehicle_t *vehicle);
+bool vehicle_is_running(vehicle_t *vehicle);
 
-    task_metrics_t      metrics_tau1;
-    task_metrics_t      metrics_tau2;
-    task_metrics_t      metrics_tau3;
-    task_metrics_t      metrics_tau4;
-} vehicle_state_t;
+void record_release(vehicle_t *vehicle, unsigned task_index,
+                    uint64_t nominal_period_us);
+double elapsed_seconds(const struct timespec *epoch);
 
-extern vehicle_state_t g_vehicle_state;
+bool sample_queue_put(vehicle_t *vehicle, const vehicle_sample_t *sample);
+bool sample_queue_take(vehicle_t *vehicle, vehicle_sample_t *sample,
+                       bool wait_for_item);
+void sample_queue_wake_all(vehicle_t *vehicle);
 
-void vehicle_state_init(vehicle_state_t *vs);
-void vehicle_state_destroy(vehicle_state_t *vs);
-
-void telemetry_push(circular_telemetry_t *ct, const telemetry_entry_t *entry);
-bool telemetry_pop(circular_telemetry_t *ct, telemetry_entry_t *entry, bool blocking);
-
-void update_task_metrics(task_metrics_t *metrics, uint64_t nominal_period_us);
-
-#endif /* VEHICLE_STATE_H */
+#endif
