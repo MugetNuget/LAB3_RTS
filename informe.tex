@@ -6,116 +6,466 @@
 \usepackage{geometry}
 \usepackage{array}
 \usepackage{booktabs}
+\usepackage{tabularx}
 \usepackage{amsmath}
 \usepackage{listings}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
 
 \geometry{margin=2.5cm}
-\setlength{\parskip}{0.5em}
+\setlength{\parskip}{0.55em}
 \setlength{\parindent}{0pt}
+\renewcommand{\arraystretch}{1.2}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{Práctica 3 -- Sistemas de Tiempo Real}
+\rhead{Universidad de Antioquia}
+\cfoot{\thepage}
+\setlength{\headheight}{15pt}
 
 \lstset{
   basicstyle=\ttfamily\small,
   breaklines=true,
   columns=fullflexible,
   keepspaces=true,
-  frame=single
+  frame=single,
+  showstringspaces=false
 }
 
-\title{Práctica 3: Implementación de Tareas Periódicas y Concurrentes de Tiempo Real}
-\author{}
-\date{}
+\newcommand{\pendiente}{\textit{[Completar con la medición real]}}
+\newcommand{\sinmedir}{\textit{Pend.}}
+\newcommand{\captura}[4]{%
+  \begin{figure}[htbp]
+    \centering
+    \IfFileExists{capturas/#1}
+      {\includegraphics[width=\linewidth,height=0.62\textheight,keepaspectratio]{capturas/#1}}
+      {\fbox{\parbox[c][4.3cm][c]{0.92\linewidth}{\centering
+        \textbf{Captura pendiente}\\[0.6em]
+        Archivo esperado: \texttt{\detokenize{capturas/#1}}\\[0.4em]
+        #2}}}
+    \caption{#3}
+    \label{fig:#4}
+  \end{figure}
+}
+
+\title{
+  \textbf{Práctica No. 3}\\
+  Implementación de tareas periódicas y concurrentes de tiempo real\\[0.5em]
+  \large Sistema simulado de control automotriz con POSIX-RT
+}
+\author{
+  \textbf{Integrantes}\\
+  [Nombre completo del estudiante 1] -- [Documento o código]\\
+  [Nombre completo del estudiante 2] -- [Documento o código]\\[0.8em]
+  Departamento de Ingeniería Electrónica\\
+  Universidad de Antioquia
+}
+\date{2026-2}
 
 \begin{document}
 
 \maketitle
+\thispagestyle{empty}
+\vspace{1em}
+
+\begin{abstract}
+Se implementó en C un simulador concurrente de control automotriz con cuatro tareas periódicas POSIX. Las tareas representan el control de estabilidad (ESC/ESP), el control de tracción (TCS), el cálculo de combustible y velocidad, y el diagnóstico de telemetría. Dos tareas se activan mediante temporizadores POSIX notificados con señales en tiempo real y dos mediante esperas absolutas sobre \texttt{CLOCK\_MONOTONIC}. Un estado de vehículo protegido por mutex y una cola circular de muestras sincronizada con variables condicionales permiten compartir resultados entre hilos. El programa mide los intervalos observados entre activaciones y su desviación respecto al período nominal. Las pruebas y los datos específicos de cada computador deben completarse con las ejecuciones reales documentadas en este informe; no se presentan resultados de Raspberry Pi que no hayan sido medidos.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\textbf{Contexto -- hilos periódicos en POSIX-RT.}
+La guía propone repasar las llamadas al sistema, las señales en tiempo real, los temporizadores y los relojes POSIX vistos en clase. Esta práctica aplica esos mecanismos a un programa multihilo en Linux: cada tarea tiene un hilo, un período, un desfase inicial y un cuerpo de procesamiento. El código se divide en archivos de cabecera y módulos fuente, y se construye con el \texttt{Makefile} incluido en el proyecto.
 
 \section{Preguntas orientadoras}
 
 \subsection{Diferencias entre temporizadores y relojes POSIX-RT}
 
-Un reloj (\textit{clock}) proporciona una referencia temporal del sistema. Puede consultarse con \texttt{clock\_gettime()} o utilizarse para esperar hasta un instante específico mediante \texttt{clock\_nanosleep()}. En esta práctica se usa \texttt{CLOCK\_MONOTONIC}, cuyo avance no depende de ajustes del reloj civil.
+Un reloj (\textit{clock}) es una fuente de referencia temporal del sistema. Puede consultarse con \texttt{clock\_gettime()} y emplearse para esperar hasta un plazo con \texttt{clock\_nanosleep()}. En esta implementación se utiliza \texttt{CLOCK\_MONOTONIC}, apropiado para medir intervalos porque no depende de los ajustes del reloj civil.
 
-Un temporizador (\textit{timer}) se crea sobre un reloj para notificar cuando vence un plazo, una sola vez o de forma periódica. Se configura con \texttt{timer\_create()} y \texttt{timer\_settime()}; la expiración puede comunicarse, por ejemplo, mediante una señal. Por tanto, el reloj es la base de tiempo y el temporizador programa notificaciones sobre esa base.
+Un temporizador POSIX (\textit{timer}) es un objeto que se crea sobre un reloj y se configura para expirar después de un plazo o repetidamente. Se crea mediante \texttt{timer\_create()} y se programa con \texttt{timer\_settime()}. Su expiración puede notificarse, entre otros mecanismos, mediante una señal. En síntesis, el reloj ofrece la base temporal y el temporizador programa notificaciones sobre esa base.
 
-En el sistema implementado, Tau 1 y Tau 2 usan temporizadores POSIX que notifican mediante señales en tiempo real. Tau 3 y Tau 4 utilizan el reloj monotónico y esperan sus fechas de activación con \texttt{clock\_nanosleep()} en modo absoluto (\texttt{TIMER\_ABSTIME}).
+En este proyecto, Tau 1 y Tau 2 utilizan temporizadores POSIX con notificación por señal. Tau 3 y Tau 4 utilizan el reloj monotónico y esperan fechas absolutas con \texttt{clock\_nanosleep()} y \texttt{TIMER\_ABSTIME}. La espera absoluta permite calcular cada activación a partir del plazo anterior más el período, en lugar de añadir el tiempo de procesamiento a cada ciclo.
 
 \subsection{Rol de las llamadas al sistema, los eventos y las señales}
 
-Las llamadas al sistema y las interfaces POSIX permiten consultar el tiempo, programar esperas, crear hilos y sincronizar su ejecución. Un evento —por ejemplo, la expiración de un temporizador— hace que un hilo que estaba esperando pueda continuar. Las señales son un mecanismo para notificar algunos de esos eventos; no reemplazan el cuerpo de la tarea. Cuando un hilo queda listo, el planificador del sistema operativo determina cuándo obtiene el procesador.
+Las llamadas al sistema y las interfaces POSIX permiten consultar el tiempo, programar esperas, crear hilos y sincronizar su ejecución. Un evento es una ocurrencia que puede habilitar una tarea, por ejemplo, la expiración de un temporizador o la notificación de una condición de sincronización. Una señal es un mecanismo de notificación; no ejecuta el cuerpo de la tarea ni reemplaza al planificador.
 
-En esta implementación, las señales \texttt{SIGRTMIN+1} y \texttt{SIGRTMIN+2} notifican las expiraciones de los temporizadores de Tau 1 y Tau 2. Los hilos esperan dichas señales con \texttt{sigwait()}. Tau 3 y Tau 4 esperan fechas absolutas mediante \texttt{clock\_nanosleep()}. Mutexes y variables condicionales protegen y coordinan el acceso a datos compartidos. Estos mecanismos organizan la concurrencia, pero un Linux convencional no garantiza por sí solo que cada activación ocurra exactamente en el instante previsto.
+En el programa, la expiración de los temporizadores de Tau 1 y Tau 2 genera, respectivamente, las señales \texttt{SIGRTMIN+1} y \texttt{SIGRTMIN+2}. Cada hilo espera la señal asignada mediante \texttt{sigwait()}. Tau 3 y Tau 4 esperan sus plazos mediante \texttt{clock\_nanosleep()}. Los mutex y las variables condicionales coordinan el acceso al estado compartido y a la cola. Una vez que un hilo queda listo, el planificador del sistema operativo decide cuándo obtiene CPU. Por ello, estos mecanismos organizan las activaciones, pero no garantizan por sí solos tiempo real duro ni ejecución en un instante exacto.
 
 \section{Sistema de control de un automóvil}
 
-\subsection{Diseño y configuración temporal}
+\subsection{Diseño del sistema}
 
-El programa simula cuatro funciones en cuatro hilos POSIX independientes: control de estabilidad, control de tracción, cálculo de combustible con actualización de velocidad y diagnóstico de telemetría. Un instante de referencia común basado en \texttt{CLOCK\_MONOTONIC} permite definir los desfases iniciales de las tareas.
+El simulador contiene cuatro hilos POSIX periódicos. Se conservan las funciones exigidas para las tres primeras tareas: control de estabilidad ESC/ESP, control de tracción TCS e inyección de combustible. Como subsistema de tiempo real leve se implementa diagnóstico de telemetría. La tarea de inyección también actualiza una estimación simplificada de velocidad para que el estado evolucione durante la simulación.
 
-\begin{table}[ht]
+\begin{table}[htbp]
   \centering
-  \caption{Tareas periódicas, mecanismos de activación y parámetros temporales.}
+  \caption{Tareas, mecanismos de activación, períodos y desfases configurados.}
   \label{tab:tareas}
-  \begin{tabular}{@{}c l l r r@{}}
+  \small
+  \begin{tabularx}{\linewidth}{@{}c X X r r@{}}
     \toprule
-    Tarea & Función & Mecanismo & Período & Desfase \\
+    Tarea & Función & Mecanismo & Período & Offset \\
     \midrule
-    Tau 1 & Estabilidad ESC & Temporizador y señal RT & 20 ms & 5 ms \\
-    Tau 2 & Tracción TCS & Temporizador y señal RT & 40 ms & 25 ms \\
-    Tau 3 & Combustible y velocidad & Reloj, espera absoluta & 80 ms & 45 ms \\
-    Tau 4 & Diagnóstico & Reloj, espera absoluta & 160 ms & 70 ms \\
+    Tau 1 & Control de estabilidad ESC/ESP & Temporizador POSIX y señal RT & 20 ms & 5 ms \\
+    Tau 2 & Control de tracción TCS & Temporizador POSIX y señal RT & 40 ms & 25 ms \\
+    Tau 3 & Inyección de combustible y actualización de velocidad & Reloj POSIX, espera absoluta & 80 ms & 45 ms \\
+    Tau 4 & Diagnóstico y telemetría (tiempo real leve) & Reloj POSIX, espera absoluta & 160 ms & 70 ms \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+Los períodos de Tau 1, Tau 2 y Tau 3 corresponden a los especificados en la guía. El período de Tau 4 fue definido en 160 ms. Los offsets son parámetros de diseño de esta implementación. Al inicio se define un epoch común situado 100 ms en el futuro; cada offset se mide respecto a ese instante.
+
+\subsection{Cuerpos de las tareas y modelo de simulación}
+
+\begin{description}
+  \item[Tau 1 -- ESC/ESP, 20 ms.] Simula la aceleración lateral de una maniobra. En la fase de maniobra, la aceleración lateral es \(0.93g\); en condiciones normales es \(0.22g\). Si supera el umbral de \(0.65g\), solicita frenado proporcional y activa una alerta de estabilidad.
+  \item[Tau 2 -- TCS, 40 ms.] Simula patinamiento de rueda del 24\% durante la fase crítica de cada ciclo de seis segundos y del 5\% en el resto. Calcula el par solicitado considerando el exceso de patinamiento y el frenado ESC. Publica una muestra del estado del vehículo en la cola de telemetría.
+  \item[Tau 3 -- Inyección, 80 ms.] Estima el nivel de combustible a partir del par, la velocidad y el frenado. Si existe una alerta de estabilidad, reduce la estimación. Actualiza también la velocidad mediante una ecuación discreta simplificada.
+  \item[Tau 4 -- Diagnóstico, 160 ms.] Espera una muestra de telemetría y luego consume las muestras adicionales disponibles. Presenta la cantidad procesada y los valores de la muestra más reciente.
+\end{description}
+
+El estado inicial es 0\% de frenado, 72\% de par, 58\% de combustible y 54 km/h. Los valores son parámetros simulados, no mediciones de un vehículo real.
+
+El control de estabilidad calcula el frenado solicitado \(B\), expresado en porcentaje, usando la aceleración lateral \(a_{\mathrm{lat}}\) en unidades de \(g\):
+\[
+ B = \operatorname{limitar}\left(
+ 120\max(a_{\mathrm{lat}}-0.65,\,0),\,0,\,45
+ \right).
+\]
+
+El control de tracción limita el par \(T\) al intervalo de 28\% a 96\%, en función del patinamiento \(S\) y del frenado:
+\[
+ T = \operatorname{limitar}\left(
+ 96-2\max(S-10,\,0)-0.22B,\,28,\,96
+ \right).
+\]
+
+El cálculo de combustible parte de:
+\[
+ F_{\mathrm{bruto}} = 24+0.62T+0.08V-0.18B,
+\]
+donde \(V\) es la velocidad en km/h. Si la alerta de estabilidad está activa, se multiplica \(F_{\mathrm{bruto}}\) por \(0.88\); luego se limita el resultado al intervalo de 15\% a 90\%.
+
+La actualización de velocidad se realiza cada \(80\) ms:
+\[
+ V_{k+1} = \operatorname{limitar}\left(
+ V_k+(0.022T-0.038B-0.22)(0.08),\,0,\,130
+ \right).
+\]
+Los coeficientes se eligieron para producir cambios acotados y observables en esta simulación. No son parámetros calibrados de un automóvil ni constituyen una estrategia apta para controlar uno.
+
+\subsection{Archivos y organización del código}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Organización de la implementación entregada.}
+  \small
+  \begin{tabularx}{\linewidth}{@{}l X@{}}
+    \toprule
+    Archivo & Responsabilidad \\
+    \midrule
+    \texttt{include/config.h} & Períodos, offsets, señales, capacidad de la cola y parámetros comunes. \\
+    \texttt{include/tasks.h}, \texttt{src/tasks.c} & Declaración e implementación de los cuatro hilos y sus cuerpos de tarea. \\
+    \texttt{include/timers\_clocks.h}, \texttt{src/timers\_clocks.c} & Creación y espera de temporizadores, esperas absolutas de reloj y operaciones sobre \texttt{timespec}. \\
+    \texttt{include/vehicle\_state.h}, \texttt{src/vehicle\_state.c} & Estado compartido, métricas, cola circular, mutexes y variables condicionales. \\
+    \texttt{src/main.c} & Configuración, inicialización, creación y cierre de hilos; impresión de configuración y métricas. \\
+    \texttt{Makefile} & Compilación, ejecución configurable y opción de enlace estático para la compilación cruzada. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+El programa se desarrolla en C para Linux y utiliza las interfaces POSIX requeridas por la guía; por tanto, depende de los servicios POSIX del sistema y no es un programa C estrictamente portable a sistemas sin hilos, temporizadores o señales POSIX.
+
+La separación en módulos permite localizar cada responsabilidad. Antes de la entrega se deben añadir o revisar comentarios breves en los fuentes para explicar la configuración de cada hilo, los eventos de activación y la estrategia de sincronización, tal como solicita la guía.
+
+\subsection{Recurso compartido y sincronización}
+
+El recurso compartido es el estado del vehículo, representado por cuatro señales: frenado, par motor, combustible y velocidad. Las tareas ESC, TCS e inyección leen y actualizan esas señales. Tau 2 toma una instantánea consistente de los valores y la publica en una cola circular de 16 elementos; Tau 4 consume las muestras para el diagnóstico.
+
+El mutex del vehículo protege las señales y las variables de escenario. La cola tiene su propio mutex, además de dos variables condicionales:
+\begin{itemize}
+  \item \texttt{item\_ready}: Tau 4 puede esperar cuando la cola está vacía.
+  \item \texttt{space\_ready}: Tau 2 puede esperar cuando la cola está llena.
+\end{itemize}
+Las condiciones se comprueban en bucles mientras se mantiene el mutex de la cola, para tolerar despertares espurios. Al cerrar, el hilo principal cambia el indicador de ejecución bajo el mutex del vehículo y difunde las variables condicionales para liberar una tarea que pudiera estar esperando. Esta sincronización protege la estructura compartida; no se usa la salida de consola como recurso compartido del cuerpo de tarea.
+
+\subsection{Señales, eventos, temporizadores y relojes}
+
+Antes de crear los hilos, el proceso bloquea \texttt{SIGRTMIN+1} y \texttt{SIGRTMIN+2} con \texttt{pthread\_sigmask()}. Los hilos heredan la máscara y cada hilo de temporizador espera su señal asignada con \texttt{sigwait()}. Los eventos notificados son las expiraciones periódicas de Tau 1 y Tau 2. Al apagar el programa, el hilo principal envía la señal correspondiente al hilo bloqueado para que este salga de su espera y cierre su temporizador.
+
+La configuración de cada temporizador POSIX usa \texttt{timer\_create()} con notificación \texttt{SIGEV\_SIGNAL}. \texttt{timer\_settime()} configura una primera expiración absoluta respecto al epoch común y un intervalo periódico. Para Tau 3 y Tau 4, la fecha inicial se obtiene sumando el offset al mismo epoch; cada espera usa \texttt{clock\_nanosleep()} con \texttt{TIMER\_ABSTIME}, y el próximo plazo se obtiene sumando exactamente un período.
+
+Las principales llamadas y funciones del sistema empleadas son \texttt{pthread\_create()}, \texttt{pthread\_join()}, \texttt{pthread\_sigmask()}, \texttt{pthread\_mutex\_lock()}, \texttt{pthread\_cond\_wait()}, \texttt{pthread\_cond\_signal()}, \texttt{timer\_create()}, \texttt{timer\_settime()}, \texttt{sigwait()}, \texttt{clock\_gettime()} y \texttt{clock\_nanosleep()}.
+
+\subsection{Makefile y construcción en el PC-Linux}
+
+El \texttt{Makefile} construye los módulos de \texttt{src/} y genera el ejecutable \texttt{automotive\_control}. La compilación usa C11, advertencias del compilador y la opción \texttt{-pthread}; el enlace incluye \texttt{-pthread}, \texttt{-lrt} y \texttt{-lm}. La opción de enlace estático se puede activar con \texttt{STATIC=1}. La duración de una ejecución se controla con \texttt{RUN\_SECONDS}.
+
+\begin{lstlisting}[caption={Comandos de construcción y ejecución usados en Linux.}]
+make clean
+make
+make run RUN_SECONDS=8
+make STATIC=1
+\end{lstlisting}
+
+La evidencia de compilación y ejecución en el PC debe incorporarse en las Figuras~\ref{fig:pc-build}, \ref{fig:pc-config}, \ref{fig:pc-telemetry} y \ref{fig:pc-metrics}.
+
+\captura{pc_compilacion.png}{Ejecución de \texttt{make clean \&\& make}, con compilación de los cuatro módulos sin errores.}{Compilación del sistema en el PC-Linux.}{pc-build}
+\captura{pc_configuracion.png}{Inicio del programa donde se observan las funciones, períodos, offsets y reloj base configurados.}{Parámetros temporales impresos por el programa en el PC-Linux.}{pc-config}
+\captura{pc_telemetria.png}{Líneas de diagnóstico con valores de las señales compartidas, número de muestras y estado de estabilidad.}{Ejecución y consistencia observable del estado compartido en el PC-Linux.}{pc-telemetry}
+\captura{pc_metricas.png}{Resumen final de activaciones, períodos medios observados, jitter máximo y estado final.}{Métricas temporales medidas durante la ejecución en el PC-Linux.}{pc-metrics}
+
+\subsection{Sincronía del arreglo compartido y mediciones}
+
+La salida periódica de diagnóstico muestra las señales copiadas a la cola por Tau 2 y consumidas por Tau 4. Para documentar la sincronía, se deben transcribir muestras de una ejecución real. No se incluyen valores inventados en esta versión del informe.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Muestras observadas del recurso compartido en el PC-Linux. Completar desde la salida de una ejecución.}
+  \label{tab:pc-sincronia}
+  \small
+  \begin{tabularx}{\linewidth}{@{}r r r r r r X@{}}
+    \toprule
+    Tiempo (s) & Muestras & Freno (\%) & Par (\%) & Combustible (\%) & Velocidad (km/h) & Alerta \\
+    \midrule
+    \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir \\
+    \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir \\
+    \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+El programa informa el número de liberaciones, el período medio observado entre activaciones y el jitter máximo. En esta implementación, el jitter es el máximo valor absoluto de la diferencia entre un intervalo medido entre dos activaciones consecutivas y el período nominal:
+\[
+ J_{\max}=\max_k\left|\left(t_k-t_{k-1}\right)-T\right|.
+\]
+Esta medición es una desviación entre intervalos de activación; no equivale a medir directamente el tiempo de respuesta desde la fecha programada hasta el inicio del cuerpo de tarea. El promedio, además, se obtiene de los intervalos registrados, por lo que debe compararse con cautela y en las mismas condiciones de carga.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Resultados reales de las tareas en el PC-Linux. Completar con el resumen impreso por el programa.}
+  \label{tab:pc-metricas}
+  \small
+  \begin{tabular}{@{}c l r r r@{}}
+    \toprule
+    Tarea & Período nominal & Activaciones & Período medio & Jitter máximo \\
+    \midrule
+    Tau 1 & 20 ms & \sinmedir & \sinmedir & \sinmedir \\
+    Tau 2 & 40 ms & \sinmedir & \sinmedir & \sinmedir \\
+    Tau 3 & 80 ms & \sinmedir & \sinmedir & \sinmedir \\
+    Tau 4 & 160 ms & \sinmedir & \sinmedir & \sinmedir \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-Los períodos de Tau 1, Tau 2 y Tau 3 coinciden con los valores de la guía; el período de Tau 4 se definió en 160 ms para el diagnóstico. Los desfases son decisiones de diseño. Al iniciar el programa se reserva un breve margen para crear los hilos y luego todas las fechas iniciales se calculan desde el mismo epoch.
+Las cifras deben obtenerse de una ejecución identificada por su duración, equipo y condiciones de prueba. Una medida cercana al período configurado es evidencia experimental de periodicidad en esa ejecución, pero no demuestra determinismo formal ni una garantía de tiempo real duro.
 
-\subsection{Cuerpos de las tareas y modelo simulado}
+\section{Ejecución en Raspberry Pi 4}
 
+\subsection{Compilación cruzada y ejecución}
+
+La compilación cruzada debe hacerse desde un PC Linux con un compilador que corresponda a la arquitectura y al sistema operativo de la Raspberry Pi. Primero se debe comprobar la arquitectura de la tarjeta con \texttt{uname -m} y \texttt{getconf LONG\_BIT}. Para una instalación Linux de 64 bits suele usarse el prefijo \texttt{aarch64-linux-gnu-}; para una instalación de 32 bits ARM suele usarse \texttt{arm-linux-gnueabihf-}. Se debe verificar que el toolchain incluya las bibliotecas de desarrollo y estáticas requeridas por \texttt{STATIC=1}.
+
+\begin{lstlisting}[caption={Ejemplo de compilación cruzada para Raspberry Pi con sistema de 64 bits.}]
+make clean
+make rpi CROSS_COMPILE=aarch64-linux-gnu-
+file automotive_control
+\end{lstlisting}
+
+Si la tarjeta usa un sistema de 32 bits, se debe sustituir el prefijo por el toolchain compatible, por ejemplo \texttt{arm-linux-gnueabihf-}. No se debe ejecutar un binario de arquitectura distinta. Tras compilar, se copia el ejecutable a la tarjeta, por ejemplo con \texttt{scp}, y se verifica en ella con \texttt{file ./automotive\_control} antes de ejecutar \texttt{./automotive\_control 8}. Deben guardarse la salida real y el identificador de la arquitectura usada.
+
+Las Figuras~\ref{fig:rpi-cross}, \ref{fig:rpi-run} y \ref{fig:rpi-metrics} están reservadas para la evidencia real de la Raspberry Pi.
+
+\captura{rpi_cross_compilacion.png}{Compilación cruzada terminada correctamente y arquitectura del binario verificada.}{Compilación cruzada del ejecutable para la Raspberry Pi 4.}{rpi-cross}
+\captura{rpi_ejecucion.png}{Ejecución del programa en la Raspberry Pi, con su configuración temporal y mensajes de diagnóstico.}{Ejecución del simulador en la Raspberry Pi 4.}{rpi-run}
+\captura{rpi_metricas.png}{Resumen final obtenido realmente en la tarjeta.}{Métricas medidas en la Raspberry Pi 4.}{rpi-metrics}
+
+\subsection{Núcleos de procesamiento: verificación pendiente}
+
+La Raspberry Pi 4 dispone de cuatro núcleos, pero crear cuatro hilos no implica automáticamente que cada hilo quede asignado a un núcleo diferente. La versión actual del programa no llama a \texttt{pthread\_setaffinity\_np()} para fijar esa asignación. El planificador puede migrar los hilos entre CPU lógicas. Por esa razón, no se afirma aquí que cada tarea esté fijada a un core ni que se haya demostrado el uso simultáneo de los cuatro.
+
+Para completar este requisito se debe capturar la información real de la tarjeta (\texttt{lscpu}) y observar los hilos del proceso durante la ejecución, por ejemplo con \texttt{top -H} o \texttt{ps -L -p <PID> -o pid,tid,psr,comm}. Estas herramientas muestran la CPU en la que se observó cada hilo; una observación puntual no demuestra afinidad permanente. Si el curso exige asignación inequívoca de un hilo por núcleo, se debe añadir y probar explícitamente la afinidad de CPU antes de afirmar que se cumplió.
+
+\captura{rpi_nucleos.png}{Salida de \texttt{lscpu} y observación concurrente de los hilos del proceso en la Raspberry Pi. La imagen por sí sola no demuestra afinidad fija si esta no se configura.}{Evidencia de arquitectura y actividad de CPU en la Raspberry Pi 4.}{rpi-cores}
+
+\subsection{Sincronía y métricas en la Raspberry Pi}
+
+Se debe llenar la Tabla~\ref{tab:rpi-metricas} usando el resumen del programa ejecutado físicamente en la Raspberry Pi. La telemetría debe transcribirse de la salida de Tau 4. Las capturas o mediciones obtenidas en un PC no pueden sustituir estos datos.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Resultados medidos en la Raspberry Pi 4.}
+  \label{tab:rpi-metricas}
+  \small
+  \begin{tabular}{@{}c l r r r@{}}
+    \toprule
+    Tarea & Período nominal & Activaciones & Período medio & Jitter máximo \\
+    \midrule
+    Tau 1 & 20 ms & \sinmedir & \sinmedir & \sinmedir \\
+    Tau 2 & 40 ms & \sinmedir & \sinmedir & \sinmedir \\
+    Tau 3 & 80 ms & \sinmedir & \sinmedir & \sinmedir \\
+    Tau 4 & 160 ms & \sinmedir & \sinmedir & \sinmedir \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Muestras del estado compartido tomadas de la ejecución en Raspberry Pi.}
+  \label{tab:rpi-sincronia}
+  \small
+  \begin{tabularx}{\linewidth}{@{}r r r r r r X@{}}
+    \toprule
+    Tiempo (s) & Muestras & Freno (\%) & Par (\%) & Combustible (\%) & Velocidad (km/h) & Alerta \\
+    \midrule
+    \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir \\
+    \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir \\
+    \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir & \sinmedir \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Comparación entre PC-Linux y Raspberry Pi 4}
+
+La comparación debe usar la misma versión del código, duración de prueba, configuración de períodos y condiciones de carga tan similares como sea posible. Los campos quedan pendientes hasta medir ambos dispositivos.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Comparación experimental del desempeño en PC-Linux y Raspberry Pi 4.}
+  \label{tab:comparacion}
+  \small
+  \begin{tabularx}{\linewidth}{@{}X r r X@{}}
+    \toprule
+    Métrica & PC-Linux & Raspberry Pi 4 & Observación \\
+    \midrule
+    Sistema operativo y versión & \sinmedir & \sinmedir & \sinmedir \\
+    Arquitectura & \sinmedir & \sinmedir & \sinmedir \\
+    Duración de prueba & \sinmedir & \sinmedir & Debe ser igual \\
+    Tau 1: período medio / jitter máximo & \sinmedir & \sinmedir & \sinmedir \\
+    Tau 2: período medio / jitter máximo & \sinmedir & \sinmedir & \sinmedir \\
+    Tau 3: período medio / jitter máximo & \sinmedir & \sinmedir & \sinmedir \\
+    Tau 4: período medio / jitter máximo & \sinmedir & \sinmedir & \sinmedir \\
+    Carga observada / afinidad de CPU & \sinmedir & \sinmedir & \sinmedir \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+El análisis debe describir qué equipo presentó mayor desviación medida, si los períodos medios se acercaron a sus valores nominales y qué diferencias podrían estar relacionadas con carga, arquitectura, kernel y planificación. No se debe concluir que un dispositivo es más determinista a partir de una única ejecución o solo por su frecuencia de CPU. También se debe indicar que el jitter informado es una medida de intervalos entre activaciones, no una garantía temporal.
+
+\section{Requisitos de presentación del informe}
+
+\subsection{Respuestas, explicación del código y resultados}
+
+Las respuestas a las preguntas orientadoras están en la Sección 1. El diseño, las cuatro tareas, el recurso compartido, la sincronización, las señales, temporizadores, relojes y Makefile se explican en la Sección 2. Los resultados experimentales se completan con las tablas y capturas de las secciones de ejecución en PC y Raspberry Pi. Las celdas marcadas como pendientes y los marcos de capturas deben reemplazarse antes de entregar.
+
+\subsection{Archivo ZIP de la carpeta de trabajo}
+
+La entrega debe adjuntar un archivo ZIP con los fuentes \texttt{.c} y \texttt{.h}, el \texttt{Makefile}, el informe y las capturas propias de las ejecuciones. Desde la raíz del proyecto se puede construir con:
+\begin{lstlisting}
+mkdir -p capturas
+zip -r entrega_practica3.zip Makefile README.md include src informe.tex capturas
+\end{lstlisting}
+Antes de crear el ZIP, se deben colocar dentro de \texttt{capturas/} todos los archivos indicados en la siguiente lista y comprobar que el archivo comprimido los incluya. No es necesario incluir ejecutables ni archivos objeto, salvo que el docente los solicite.
+
+\subsection{Declaración de uso de inteligencia artificial}
+
+Durante la preparación de este trabajo se utilizó una herramienta de inteligencia artificial generativa como apoyo para revisar la guía, organizar explicaciones, desarrollar y revisar partes de la implementación en C y estructurar este borrador de informe en \LaTeX. Los integrantes son responsables de verificar y comprender el código y el contenido entregado, adaptar el texto a su experiencia y completar personalmente las pruebas, mediciones y capturas. Los resultados de PC o Raspberry Pi no se deben atribuir a la herramienta ni completar sin haberlos medido.
+
+La declaración debe ajustarse a las indicaciones académicas del curso y al formato institucional de referencia sobre uso de IA: \url{https://revistas.ucasal.edu.ar/index.php/CI/ia}.
+
+\subsection{Conclusiones}
+
+\begin{enumerate}
+  \item La práctica integra cuatro hilos periódicos con dos estrategias de activación POSIX: temporizadores que notifican mediante señales y esperas absolutas basadas en \texttt{CLOCK\_MONOTONIC}. Esta división permite contrastar ambos mecanismos en un mismo programa.
+  \item El arreglo de señales y la cola circular representan un recurso compartido entre las tareas. Los mutex y las variables condicionales protegen el acceso concurrente y permiten coordinar productor y consumidor sin sondeo continuo.
+  \item Las métricas impresas permiten observar períodos medios e intervalos desviados durante las ejecuciones realizadas. Para concluir sobre diferencias entre PC y Raspberry Pi se deben comparar mediciones repetidas, con duración y condiciones documentadas; los datos quedan pendientes hasta completar esas pruebas.
+  \item La implementación simula funciones automotrices con ecuaciones acotadas y parámetros elegidos para la práctica. No corresponde a un controlador de seguridad automotriz ni a un sistema de tiempo real duro certificado.
+  \item La evidencia de uso de los cuatro núcleos de Raspberry Pi requiere verificar la actividad de CPU durante una ejecución y, si se exige asignación por tarea, configurar y comprobar afinidad explícita. La versión actual no fija esa afinidad.
+\end{enumerate}
+
+\subsection{Bibliografía}
+
+\begin{thebibliography}{9}
+
+\bibitem{guia}
+Departamento de Ingeniería Electrónica, Universidad de Antioquia.
+\textit{Práctica No. 3: Implementación de Tareas Periódicas y Concurrentes de Tiempo-Real}.
+Sistemas de Tiempo Real, período 2026-2.
+
+\bibitem{modulo}
+G. Patigno.
+\textit{RTS\_2026-2, Módulo 2}.
+\url{https://github.com/gpatigno/RTS_2026-2/tree/main/MODULO2}.
+Consultado en 2026.
+
+\bibitem{timercreate}
+The Linux man-pages project.
+\textit{timer\_create(2) -- create a POSIX per-process timer}.
+\url{https://man7.org/linux/man-pages/man2/timer_create.2.html}.
+
+\bibitem{timersettime}
+The Linux man-pages project.
+\textit{timer\_settime(2) -- arm/disarm and fetch state of POSIX per-process timer}.
+\url{https://man7.org/linux/man-pages/man2/timer_settime.2.html}.
+
+\bibitem{clocksleep}
+The Linux man-pages project.
+\textit{clock\_nanosleep(2) -- high-resolution sleep with specifiable clock}.
+\url{https://man7.org/linux/man-pages/man2/clock_nanosleep.2.html}.
+
+\bibitem{signals}
+The Linux man-pages project.
+\textit{signal(7) -- overview of signals}.
+\url{https://man7.org/linux/man-pages/man7/signal.7.html}.
+
+\bibitem{pthread}
+The Linux man-pages project.
+\textit{pthreads(7) -- POSIX threads}.
+\url{https://man7.org/linux/man-pages/man7/pthreads.7.html}.
+
+\bibitem{ia}
+Universidad Católica de Salta.
+\textit{Declaración de uso de inteligencia artificial: ejemplo de referencia indicado en la guía}.
+\url{https://revistas.ucasal.edu.ar/index.php/CI/ia}.
+
+\end{thebibliography}
+
+\appendix
+\section{Lista de capturas y nombres de archivo}
+
+Las figuras de este documento buscan imágenes dentro de la carpeta \texttt{capturas/}. Los nombres deben coincidir exactamente con los siguientes:
 \begin{itemize}
-  \item \textbf{Tau 1 -- Estabilidad:} genera una aceleración lateral simulada que normalmente es \(0.22g\), y sube a \(0.93g\) durante la fase de maniobra de cada ciclo de cinco segundos. Si supera el umbral de \(0.65g\), solicita frenado proporcional y activa una alerta.
-  \item \textbf{Tau 2 -- Tracción:} simula un patinamiento del 24\% durante una fase de cada ciclo de seis segundos y del 5\% en el resto. A partir de ese valor y del frenado solicitado calcula el par motor. Después publica una muestra del estado compartido en la cola de telemetría.
-  \item \textbf{Tau 3 -- Combustible y velocidad:} estima el nivel de combustible a partir del par, la velocidad y el frenado. Si la alerta de estabilidad está activa, reduce el valor calculado. También actualiza la velocidad con un modelo discreto simplificado.
-  \item \textbf{Tau 4 -- Diagnóstico:} consume las muestras de telemetría disponibles y presenta la más reciente junto con el número de muestras procesadas desde el diagnóstico anterior.
+  \item \texttt{pc\_compilacion.png}: compilación normal del PC sin errores.
+  \item \texttt{pc\_configuracion.png}: duración, reloj base, funciones, períodos y offsets impresos.
+  \item \texttt{pc\_telemetria.png}: salida de Tau 4 que muestra las señales compartidas.
+  \item \texttt{pc\_metricas.png}: resumen final de activaciones, período medio y jitter.
+  \item \texttt{rpi\_cross\_compilacion.png}: compilación cruzada y tipo de ejecutable.
+  \item \texttt{rpi\_ejecucion.png}: configuración y telemetría producidas al ejecutar en la tarjeta.
+  \item \texttt{rpi\_metricas.png}: resumen de métricas obtenido en la tarjeta.
+  \item \texttt{rpi\_nucleos.png}: arquitectura y observación de hilos/CPU durante la ejecución.
 \end{itemize}
 
-Las operaciones son una simulación de propósito académico, no un modelo físico validado ni una estrategia apta para controlar un vehículo real.
+En Overleaf, subir \texttt{informe.tex}, el código y una carpeta \texttt{capturas/} con esos nombres. Mientras una imagen no exista, el documento muestra un recuadro de marcador para esa figura; al subir el archivo correspondiente, se inserta automáticamente.
 
-El arreglo compartido contiene cuatro señales: frenado solicitado, par motor, nivel de combustible y velocidad. Sus valores iniciales son 0\% de frenado, 72\% de par, 58\% de combustible y 54 km/h. El cálculo de frenado usa el exceso de aceleración lateral sobre el umbral:
-\[
-  B = \operatorname{limitar}\left(120(a_{\mathrm{lat}}-0.65),\,0,\,45\right),
-\]
-donde \(a_{\mathrm{lat}}\) se expresa en unidades de \(g\), y \(B\) es el porcentaje de frenado solicitado.
+\section{Lista de verificación antes de entregar}
 
-El TCS limita el par calculado al intervalo de 28\% a 96\%:
-\[
-  T = \operatorname{limitar}\left(
-  96 - 2\max(S-10,0)-0.22B,\,28,\,96\right),
-\]
-donde \(S\) es el patinamiento porcentual. La estimación de combustible es:
-\[
-  F = \operatorname{limitar}(24+0.62T+0.08V-0.18B,\,15,\,90),
-\]
-donde \(V\) representa la velocidad en km/h. Con la alerta activa, \(F\) se multiplica por \(0.88\). Finalmente, la velocidad se actualiza cada 80 ms mediante el modelo discreto:
-\[
-  V_{k+1} = \operatorname{limitar}\left(
-  V_k + (0.022T-0.038B-0.22)\,0.08,\,0,\,130\right).
-\]
-Los coeficientes se eligieron para producir una respuesta acotada y observable en la simulación; no representan unidades ni parámetros de un vehículo real.
-
-\subsection{Recursos compartidos y sincronización}
-
-El estado global del vehículo contiene las cuatro señales, las variables de escenario, las métricas temporales y la cola de muestras. Un mutex protege las lecturas y actualizaciones de las señales y las variables de escenario.
-
-La cola circular de telemetría dispone de un mutex propio y dos variables condicionales. El productor espera en \texttt{space\_ready} si la cola está llena y el consumidor espera en \texttt{item\_ready} cuando no hay datos. Al insertar o retirar una muestra, se notifica a la otra parte. Las comprobaciones se realizan en bucles asociados al mutex para tolerar despertares espurios. Al detener el programa se cambia el estado de ejecución bajo el mutex del vehículo y se despiertan los posibles hilos bloqueados en la cola.
-
-\subsection{Temporizadores, relojes y señales}
-
-El programa bloquea las señales de los dos temporizadores antes de crear los hilos. Tau 1 y Tau 2 configuran temporizadores con \texttt{timer\_create()} y \texttt{timer\_settime()}, usando \texttt{TIMER\_ABSTIME} para basar la primera expiración en el epoch común y un intervalo para las siguientes. Cada hilo espera su señal con \texttt{sigwait()} y ejecuta su cuerpo tras cada notificación. Al terminar, el hilo principal cambia el estado de ejecución y envía a esos hilos la señal correspondiente para liberarlos de la espera.
-
-Tau 3 y Tau 4 calculan su primera fecha de activación a partir del mismo epoch. En cada ciclo esperan con \texttt{clock\_nanosleep()} y \texttt{TIMER\_ABSTIME}, y avanzan la fecha objetivo exactamente en un período. Esto evita basar la siguiente fecha en el final del procesamiento anterior.
-
-\subsection{Medición y límites de la simulación}
-
-Cada hilo registra el número de activaciones, el período medio observado y la desviación máxima respecto al período nominal (jitter). Estas mediciones permiten comparar el comportamiento observado con los períodos configurados, pero no constituyen una prueba formal de determinismo ni una garantía de tiempo real duro. Los resultados dependen de la carga y de la planificación del sistema anfitrión.
+\begin{itemize}
+  \item Sustituir los nombres, códigos de estudiante, sistema operativo y datos del equipo.
+  \item Ejecutar las pruebas reales en PC-Linux y completar las Tablas~\ref{tab:pc-sincronia} y \ref{tab:pc-metricas}.
+  \item Compilar y ejecutar en Raspberry Pi 4; completar las Tablas~\ref{tab:rpi-metricas}, \ref{tab:rpi-sincronia} y \ref{tab:comparacion}.
+  \item Capturar las evidencias listadas en el apéndice. No afirmar asignación de los cuatro cores sin haberla comprobado.
+  \item Revisar con el docente o la guía si se exige fijar cada hilo a un núcleo. La implementación actual no realiza esa fijación.
+  \item Completar la declaración de IA según las reglas del curso.
+  \item Crear y revisar \texttt{entrega\_practica3.zip} con fuentes, Makefile, informe y capturas.
+\end{itemize}
 
 \end{document}
